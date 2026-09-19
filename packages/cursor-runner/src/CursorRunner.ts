@@ -83,14 +83,25 @@ function normalizeError(error: unknown): string {
 	return "Cursor execution failed";
 }
 
-function normalizeCursorModel(model?: string): string | undefined {
-	if (!model) return model;
-	// Map legacy CLI aliases to SDK model IDs. The SDK rejects `auto` and bare
-	// `gpt-5`; use `default` (server-side resolution) as a forward-compatible
-	// fallback for both. Discover real ids via `Cursor.models.list()`.
+function normalizeCursorModel(
+	model?: string,
+): { id: string; params?: Array<{ id: string; value: string }> } | undefined {
+	if (!model) return undefined;
 	const lowered = model.toLowerCase();
-	if (lowered === "gpt-5" || lowered === "auto") return "default";
-	return model;
+	// Older CLI selectors encode SDK parameters in the model name.
+	const grok = /^cursor-(grok-4\.[56])-(low|medium|high|xhigh)(-fast)?$/.exec(
+		lowered,
+	);
+	if (grok)
+		return {
+			id: grok[1]!,
+			params: [
+				{ id: "effort", value: grok[2]! },
+				{ id: "fast", value: grok[3] ? "true" : "false" },
+			],
+		};
+	if (lowered === "gpt-5" || lowered === "auto") return { id: "default" };
+	return { id: model };
 }
 
 function createAssistantToolUseMessage(
@@ -408,6 +419,7 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 	private formatter: IMessageFormatter;
 	private agent: SDKAgent | null = null;
 	private currentRun: Run | null = null;
+	private selectedModel: ReturnType<typeof normalizeCursorModel>;
 	private pendingResultMessage: SDKResultMessage | null = null;
 	private hasInitMessage = false;
 	private lastAssistantText: string | null = null;
@@ -453,6 +465,7 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 		this.messages = [];
 		this.pendingResultMessage = null;
 		this.hasInitMessage = false;
+		this.selectedModel = undefined;
 		this.lastAssistantText = null;
 		this.assistantTextBuffer = "";
 		this.tokenTotals = {
@@ -484,17 +497,42 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 			}
 
 			const apiKey = this.config.cursorApiKey ?? process.env.CURSOR_API_KEY;
-			const normalizedModel = normalizeCursorModel(this.config.model);
+			let normalizedModel = normalizeCursorModel(this.config.model);
+			const { Agent, Cursor } = await import("@cursor/sdk");
+			if (
+				normalizedModel &&
+				!normalizedModel.params?.some((param) => param.id === "effort")
+			) {
+				try {
+					const models = await Cursor.models.list({ apiKey });
+					const defaults = models
+						.find((model) => model.id === normalizedModel?.id)
+						?.variants?.find((variant) => variant.isDefault)?.params;
+					if (defaults?.length) {
+						const params = new Map(
+							defaults.map((param) => [param.id, param.value]),
+						);
+						for (const param of normalizedModel.params ?? [])
+							params.set(param.id, param.value);
+						normalizedModel = {
+							...normalizedModel,
+							params: [...params].map(([id, value]) => ({ id, value })),
+						};
+					}
+				} catch {
+					// Catalog access is optional; keep the selection and leave unknown effort unset.
+				}
+			}
+			this.selectedModel = normalizedModel;
 			const mcpServers = mapCyrusMcpToSdk(this.config.mcpConfig);
 
 			const sandboxEnabled = Boolean(this.config.sandboxSettings?.enabled);
 			const baseAgentOptions = {
 				apiKey,
-				...(normalizedModel ? { model: { id: normalizedModel } } : {}),
+				...(normalizedModel ? { model: normalizedModel } : {}),
 				local: {
-					// `cwd` is passed as a string[] per Cyrus convention; the SDK
-					// types accept `string | string[]`.
-					cwd: [workspace],
+					// The SDK requires one primary path; additional roots use `dirs`.
+					cwd: workspace,
 					settingSources: ["project" as const],
 					// SDK ≥1.0.11 auto-discovers the bundled `cursorsandbox`
 					// helper from the platform-specific optionalDependency
@@ -507,7 +545,6 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 				...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
 			};
 
-			const { Agent } = await import("@cursor/sdk");
 			let agent: SDKAgent;
 			if (this.config.resumeSessionId) {
 				console.log(
@@ -1020,14 +1057,28 @@ export class CursorRunner extends EventEmitter implements IAgentRunner {
 		if (this.hasInitMessage) return;
 		this.hasInitMessage = true;
 		const sessionId = this.sessionInfo?.sessionId || crypto.randomUUID();
-		const initMessage: SDKSystemInitMessage = {
+		const selection = this.agent?.model ?? this.selectedModel;
+		const reasoningEffort =
+			selection?.params?.find((param) => param.id === "effort")?.value ??
+			this.selectedModel?.params?.find((param) => param.id === "effort")?.value;
+		const fastValue =
+			selection?.params?.find((param) => param.id === "fast")?.value ??
+			this.selectedModel?.params?.find((param) => param.id === "fast")?.value;
+		const fastMode =
+			fastValue === "true" ? true : fastValue === "false" ? false : undefined;
+		const initMessage: SDKSystemInitMessage & {
+			reasoningEffort?: string;
+			fastMode?: boolean;
+		} = {
 			type: "system",
 			subtype: "init",
 			cwd: this.config.workingDirectory || cwd(),
 			session_id: sessionId,
 			tools: this.config.allowedTools || [],
 			mcp_servers: [],
-			model: this.config.model || "gpt-5",
+			model: selection?.id || this.config.model || "gpt-5",
+			...(reasoningEffort ? { reasoningEffort } : {}),
+			...(fastMode !== undefined ? { fastMode } : {}),
 			permissionMode: "default",
 			apiKeySource: this.config.cursorApiKey ? "user" : "project",
 			claude_code_version: "cursor-agent",
